@@ -225,3 +225,58 @@ class SuperPoint(Extractor):
             "keypoint_scores": torch.stack(scores, 0),
             "descriptors": torch.stack(descriptors, 0).transpose(-1, -2).contiguous(),
         }
+
+    def _extract_dense_descriptors(self, data: dict) -> torch.Tensor:
+        """Extract dense descriptor map without keypoint detection
+
+        Args:
+            data: Dictionary containing 'image' key
+
+        Returns:
+            Dense descriptor tensor [B, C, H/8, W/8]
+        """
+        image = data["image"]
+        if image.shape[1] == 3:
+            image = rgb_to_grayscale(image)
+
+        # Shared Encoder (same as forward method)
+        x = self.relu(self.conv1a(image))
+        x = self.relu(self.conv1b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv2a(x))
+        x = self.relu(self.conv2b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv3a(x))
+        x = self.relu(self.conv3b(x))
+        x = self.pool(x)
+        x = self.relu(self.conv4a(x))
+        x = self.relu(self.conv4b(x))
+
+        # Compute the dense descriptors
+        cDa = self.relu(self.convDa(x))
+        descriptors = self.convDb(cDa)
+        descriptors = torch.nn.functional.normalize(descriptors, p=2, dim=1)
+
+        return descriptors
+
+    def _sample_descriptors_at_locations(
+        self, keypoints: torch.Tensor, descriptors: torch.Tensor
+    ) -> torch.Tensor:
+        """Sample descriptors at given keypoint locations for SuperPoint
+
+        Args:
+            keypoints: [B, N, 2] keypoint coordinates in (x, y) format
+            descriptors: [B, C, H, W] dense descriptor map
+
+        Returns:
+            [B, N, C] sampled descriptors
+        """
+        # SuperPoint uses a specific sampling method with stride 8
+        batch_descriptors = []
+        for i in range(keypoints.shape[0]):
+            kpts = keypoints[i:i+1]  # [1, N, 2]
+            desc = descriptors[i:i+1]  # [1, C, H, W]
+            sampled = sample_descriptors(kpts, desc, s=8)  # [1, C, N]
+            batch_descriptors.append(sampled.transpose(1, 2))  # [1, N, C]
+
+        return torch.cat(batch_descriptors, dim=0)  # [B, N, C]

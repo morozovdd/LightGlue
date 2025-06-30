@@ -146,6 +146,165 @@ class Extractor(torch.nn.Module):
         feats["keypoints"] = (feats["keypoints"] + 0.5) / scales[None] - 0.5
         return feats
 
+    @torch.no_grad()
+    def extract_descriptors_at_keypoints(
+        self, 
+        img: torch.Tensor, 
+        keypoints: torch.Tensor, 
+        **conf
+    ) -> dict:
+        """Extract descriptors at custom keypoint locations
+        
+        Args:
+            img: Input image tensor [H, W] or [C, H, W] or [B, C, H, W]
+            keypoints: Keypoint coordinates [N, 2] or [B, N, 2] in (x, y) format
+            **conf: Additional preprocessing configuration
+            
+        Returns:
+            dict containing:
+                - descriptors: [B, N, D] tensor of descriptors
+                - keypoints: [B, N, 2] tensor of keypoints in image coordinates
+                - image_size: [B, 2] tensor of original image size
+        """
+        # Handle input dimensions
+        if img.dim() == 2:
+            img = img[None, None]  # H,W -> B,C,H,W
+        elif img.dim() == 3:
+            img = img[None]  # C,H,W -> B,C,H,W
+        assert img.dim() == 4, f"Image must be 2D, 3D or 4D, got {img.dim()}D"
+        
+        # Handle keypoints dimensions
+        if keypoints.dim() == 2:
+            keypoints = keypoints[None]  # N,2 -> B,N,2
+        assert keypoints.dim() == 3 and keypoints.shape[-1] == 2, \
+            f"Keypoints must be [N,2] or [B,N,2], got {keypoints.shape}"
+        
+        batch_size = img.shape[0]
+        assert keypoints.shape[0] == batch_size or keypoints.shape[0] == 1, \
+            f"Batch size mismatch: img={batch_size}, keypoints={keypoints.shape[0]}"
+        
+        # Expand keypoints to match batch size if needed
+        if keypoints.shape[0] == 1 and batch_size > 1:
+            keypoints = keypoints.expand(batch_size, -1, -1)
+        
+        original_shape = img.shape[-2:][::-1]  # (W, H)
+        
+        # Preprocess image (resize if needed)
+        img, scales = ImagePreprocessor(**{**self.preprocess_conf, **conf})(img)
+        
+        # Scale keypoints to match resized image
+        scaled_keypoints = (keypoints + 0.5) * scales[None] - 0.5
+        
+        # Forward pass to get feature maps (without keypoint detection)
+        # We need to call the underlying network to get dense descriptors
+        if hasattr(self, '_extract_dense_descriptors'):
+            # If the model provides a method to extract dense descriptors
+            dense_descriptors = self._extract_dense_descriptors({"image": img})
+        elif hasattr(self, 'extract_dense_map'):
+            # For ALIKED-style models
+            feature_map, _ = self.extract_dense_map(img)
+            dense_descriptors = feature_map
+        else:
+            # Fallback: run full forward pass and try to extract dense descriptors
+            try:
+                dense_descriptors = self._compute_dense_descriptors_fallback(img)
+            except NotImplementedError:
+                raise NotImplementedError(
+                    f"Extractor {self.__class__.__name__} doesn't support dense descriptor extraction. "
+                    "Please implement one of: '_extract_dense_descriptors', 'extract_dense_map', "
+                    "or '_compute_dense_descriptors_fallback' methods."
+                )
+        
+        # Sample descriptors at keypoint locations
+        descriptors = self._sample_descriptors_at_locations(
+            scaled_keypoints, dense_descriptors
+        )
+        
+        return {
+            "descriptors": descriptors,
+            "keypoints": keypoints,  # Return original keypoints
+            "image_size": torch.tensor(original_shape)[None].to(img).float().expand(batch_size, -1),
+        }
+    
+    def _sample_descriptors_at_locations(
+        self, 
+        keypoints: torch.Tensor, 
+        descriptors: torch.Tensor
+    ) -> torch.Tensor:
+        """Sample descriptors at given keypoint locations using bilinear interpolation
+        
+        Args:
+            keypoints: [B, N, 2] keypoint coordinates in (x, y) format
+            descriptors: [B, C, H, W] dense descriptor map
+            
+        Returns:
+            [B, N, C] sampled descriptors
+        """
+        b, c, h, w = descriptors.shape
+        _, n, _ = keypoints.shape
+        
+        # Normalize keypoints to [-1, 1] for grid_sample
+        normalized_kpts = keypoints.clone()
+        normalized_kpts[..., 0] = 2.0 * keypoints[..., 0] / (w - 1) - 1.0  # x coordinate
+        normalized_kpts[..., 1] = 2.0 * keypoints[..., 1] / (h - 1) - 1.0  # y coordinate
+        
+        # Reshape for grid_sample: [B, 1, N, 2]
+        grid = normalized_kpts.unsqueeze(1)
+        
+        # Sample descriptors
+        args = {"align_corners": True} if torch.__version__ >= "1.3" else {}
+        sampled = torch.nn.functional.grid_sample(
+            descriptors, grid, mode="bilinear", padding_mode="border", **args
+        )
+        
+        # Reshape to [B, C, N] then transpose to [B, N, C]
+        sampled = sampled.squeeze(2).transpose(1, 2)
+        
+        # Normalize descriptors
+        sampled = torch.nn.functional.normalize(sampled, p=2, dim=-1)
+        
+        return sampled
+    
+    def _compute_dense_descriptors_fallback(self, img: torch.Tensor) -> torch.Tensor:
+        """Fallback method to compute dense descriptors for models that don't expose them directly
+        
+        This method attempts different strategies to extract dense descriptors from models
+        that may not have explicit support for it.
+        
+        Args:
+            img: Input image tensor [B, C, H, W]
+            
+        Returns:
+            Dense descriptor tensor [B, C, H', W']
+        """
+        # Strategy 1: Try to extract from feature computation parts
+        if hasattr(self, 'model') and hasattr(self.model, 'extract_features'):
+            # For models like DISK that might have feature extraction
+            try:
+                features = self.model.extract_features(img)
+                if hasattr(features, 'descriptors'):
+                    return features.descriptors
+            except:
+                pass
+        
+        # Strategy 2: Run forward and look for intermediate outputs
+        # This is a more aggressive fallback that may not work for all models
+        if hasattr(self, 'model'):
+            # For wrapped models, try to access internal feature computation
+            try:
+                # This is model-specific and may need customization
+                raise NotImplementedError(
+                    f"Dense descriptor extraction not implemented for {self.__class__.__name__}. "
+                    "This model may not support custom keypoint extraction."
+                )
+            except:
+                pass
+        
+        raise NotImplementedError(
+            f"Cannot extract dense descriptors from {self.__class__.__name__}. "
+            "This model doesn't support custom keypoint extraction with the current implementation."
+        )
+
 
 def match_pair(
     extractor,

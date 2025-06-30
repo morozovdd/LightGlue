@@ -756,3 +756,40 @@ class ALIKED(Extractor):
             "descriptors": torch.stack(descriptors),  # B x N x D
             "keypoint_scores": torch.stack(kptscores),  # B x N
         }
+
+    def _sample_descriptors_at_locations(
+        self, 
+        keypoints: torch.Tensor, 
+        descriptors: torch.Tensor
+    ) -> torch.Tensor:
+        """Sample descriptors at given keypoint locations for ALIKED
+        
+        Args:
+            keypoints: [B, N, 2] keypoint coordinates in (x, y) format
+            descriptors: [B, C, H, W] dense descriptor map (feature_map from extract_dense_map)
+            
+        Returns:
+            [B, N, C] sampled descriptors
+        """
+        b, c, h, w = descriptors.shape
+        _, n, _ = keypoints.shape
+        
+        # Normalize keypoints to [-1, 1] for grid_sample
+        normalized_kpts = keypoints.clone()
+        normalized_kpts[..., 0] = 2.0 * keypoints[..., 0] / (w - 1) - 1.0  # x coordinate
+        normalized_kpts[..., 1] = 2.0 * keypoints[..., 1] / (h - 1) - 1.0  # y coordinate
+        
+        # Reshape for grid_sample: [B, 1, N, 2]
+        grid = normalized_kpts.unsqueeze(1)
+        
+        # Sample descriptors using bilinear interpolation
+        args = {"align_corners": True} if torch.__version__ >= "1.3" else {}
+        sampled = torch.nn.functional.grid_sample(
+            descriptors, grid, mode="bilinear", padding_mode="border", **args
+        )
+        
+        # Reshape to [B, C, N] then transpose to [B, N, C]
+        sampled = sampled.squeeze(2).transpose(1, 2)
+        
+        # ALIKED descriptors are already normalized in extract_dense_map
+        return sampled

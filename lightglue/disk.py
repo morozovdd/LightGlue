@@ -53,3 +53,26 @@ class DISK(Extractor):
             "keypoint_scores": scores.to(image).contiguous(),
             "descriptors": descriptors.to(image).contiguous(),
         }
+
+    def _compute_dense_descriptors_fallback(self, img: torch.Tensor) -> torch.Tensor:
+        """Fallback method for DISK to extract dense descriptors
+
+        Note: DISK uses Kornia's implementation which doesn't directly expose dense descriptors.
+        This is a limitation of the current Kornia DISK implementation.
+
+        Args:
+            img: Input image tensor [B, C, H, W]
+
+        Returns:
+            Dense descriptor tensor [B, C, H', W']
+        """
+        raise NotImplementedError(
+            "DISK model doesn't support custom keypoint extraction due to limitations "
+            "in the Kornia implementation. The Kornia DISK model doesn't expose dense "
+            "descriptor maps, only keypoint-based descriptors. "
+            "\n\nSupported models for custom keypoint extraction:"
+            "\n- SuperPoint"
+            "\n- ALIKED"
+            "\n\nIf you need DISK with custom keypoints, you may need to use a different "
+            "DISK implementation that exposes dense feature maps."
+        )
